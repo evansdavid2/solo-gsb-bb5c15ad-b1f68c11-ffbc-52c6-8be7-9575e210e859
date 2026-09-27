@@ -380,6 +380,48 @@ class ReviewReportVerifyResponse(BaseModel):
     )
 
 
+class RepairPackageIn(BaseModel):
+    """候选修补工包：唯一编号 + 正整数成本 + 覆盖的观察编号。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_id: str = Field(..., min_length=1, max_length=64,
+                            description="工包编号；同一请求内必须唯一")
+    cost: int = Field(..., gt=0, description="工包成本（正整数）")
+    covers: List[str] = Field(
+        default_factory=list,
+        description="该工包覆盖的观察编号；必须全部属于报告来源观察",
+    )
+
+
+class RepairPlanOptimizeRequest(BaseModel):
+    """修补工包优化请求（只读，基于已签发报告快照）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_id: str = Field(..., max_length=64,
+                           description="已签发的复核报告编号")
+    packages: List[RepairPackageIn] = Field(
+        default_factory=list, max_length=20,
+        description="候选修补工包列表（至多 20 个）",
+    )
+
+
+class RepairPlanOptimizeResponse(BaseModel):
+    """最低成本修补方案（只读计算结果，不修改报告或观察）。"""
+
+    report_id: str
+    targets: List[str] = Field(
+        ..., description="报告来源中去重后的全部观察编号（升序）",
+    )
+    target_count: int = Field(..., description="目标观察数量")
+    selected_package_ids: List[str] = Field(
+        ..., description="选中的工包编号（升序）",
+    )
+    package_count: int = Field(..., description="选中工包数量")
+    total_cost: int = Field(..., description="选中工包的成本合计")
+
+
 class InspectionChangeReport(BaseModel):
     """两期巡检的裂纹轨迹变化报告（只读，实时计算）。"""
 

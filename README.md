@@ -17,6 +17,10 @@
   裁决 `revision`、实时生成轨迹，将轨迹及来源、观察/裁决**两类输入指纹**与签发时间
   固化为**不可变报告**；报告读取永远返回签发快照，核验接口只读重算指纹并指出
   观察或裁决是否已变化；
+- 提供**修补工包优化**：以已签发报告快照的**全部来源观察**（去重）为目标，从候选工包
+  （唯一编号 + 正整数成本 + 覆盖观察编号）中**精确**选出覆盖全部目标且**总成本最小**
+  的子集，并列时依次取工包数更少、编号序列字典序更小者；目标与工包各限 20 个，
+  全程只读，不修改报告或观察；
 - 依赖安装、SQLite 建表与数据库初始化均随容器启动自动完成。
 
 ## 单条命令启动
@@ -103,6 +107,7 @@ docker compose up -d --build
 | POST | `/review-reports` | 签发不可变叶片复核报告（同事务校验 revision、实时成轨并固化） |
 | GET | `/review-reports/{report_id}` | 读取报告签发快照（不可变，不受后续观察/裁决变化影响） |
 | GET | `/review-reports/{report_id}/verify` | 只读核验：重算两类指纹，指出观察/裁决变化及是否仍为当前版本 |
+| POST | `/repair-plans/optimize` | 只读修补工包优化：对已签发报告的全部来源观察求最低成本全覆盖方案 |
 
 ### 1. 写入观察批次
 
@@ -557,6 +562,61 @@ curl -s "http://localhost:8000/api/v1/inspection-changes/WT-A01/B2?before=drone-
 - `is_current`：报告是否仍为当前版本——**两类指纹均未变化**时为 `true`；
 - 核验不执行成轨计算，即使当前裁决相互冲突也能正常返回指纹比对结果。
 
+### 9. 修补工包优化（只读）
+
+`POST /api/v1/repair-plans/optimize`
+
+以一份**已签发报告**的签发快照为输入，从候选修补工包中**精确**求出覆盖全部目标观察
+且**总成本最小**的工包子集。接口只读：**只读取报告快照**，不读取现库观察，
+也不修改报告、观察或任何已落库数据。
+
+- **目标集合**：报告快照各轨迹来源观察**去重后**的全部观察编号（与签发后观察/裁决
+  变化无关）；
+- **候选工包**：`package_id`（请求内唯一）+ `cost`（**正整数**）+ `covers`
+  （该工包覆盖的观察编号，须全部属于目标集合）；
+- **规模上限**：目标观察与候选工包各限 **20** 个；
+- **选择规则**：总成本最小；成本相同时依次取**工包数更少**、**排序后编号序列
+  字典序更小**者（精确求解，非贪心近似）；
+- **空目标**（报告快照无来源观察）返回空方案：不选工包、总成本 `0`。
+
+请求示例：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "packages": [
+    {"package_id": "pkg-a", "cost": 5, "covers": ["s1", "s2"]},
+    {"package_id": "pkg-b", "cost": 3, "covers": ["s3"]},
+    {"package_id": "pkg-c", "cost": 9, "covers": ["s1", "s2", "s3"]}
+  ]
+}
+```
+
+成功响应 `200`：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "targets": ["s1", "s2", "s3"],
+  "target_count": 3,
+  "selected_package_ids": ["pkg-a", "pkg-b"],
+  "package_count": 2,
+  "total_cost": 8
+}
+```
+
+错误分支：
+
+- 报告不存在 → `404`；
+- 工包编号重复、工包覆盖了报告外的未知观察（响应回带
+  `unknown_observation_ids`）、目标或工包数量越限、成本非正整数 → `422`；
+- 无法全覆盖 → `409`，响应回带所有**未被任何工包覆盖**的观察编号：
+
+```json
+{ "detail": "候选工包无法全覆盖目标观察，1 个观察未被任何工包覆盖",
+  "uncovered_observation_ids": ["s3"] }
+```
+
 ## curl 快速验证
 
 ```bash
@@ -607,6 +667,16 @@ curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1
 curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1/verify
 ```
 
+修补工包优化（基于已签发报告快照，只读）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/repair-plans/optimize \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id":"rep-demo-1","packages":[
+        {"package_id":"pkg-a","cost":5,"covers":["s1","s2"]},
+        {"package_id":"pkg-b","cost":9,"covers":["s1","s2"]}]}'
+```
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -628,7 +698,7 @@ python -m unittest discover -s tests -v
 ├── app/
 │   ├── main.py         # FastAPI 入口、路由、startup 建表
 │   ├── schemas.py      # Pydantic 请求/响应模型与字段校验
-│   ├── services.py     # 写入幂等、重算、查询、巡检变化、复核报告签发/核验业务逻辑
+│   ├── services.py     # 写入幂等、重算、查询、巡检变化、复核报告签发/核验、修补工包优化业务逻辑
 │   ├── clustering.py   # 并查集聚类 + 轨迹合并
 │   ├── matching.py     # 跨期轨迹配对：重叠面积加权 + 全局最大权一对一匹配
 │   ├── coverage.py     # 只读修补覆盖核对：径向切片精确求修补区域并集覆盖面积

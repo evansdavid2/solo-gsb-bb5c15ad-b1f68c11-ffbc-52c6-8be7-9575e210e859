@@ -25,6 +25,7 @@ from .schemas import (
     BatchWriteRequest,
     ObservationIn,
     RepairCoverageRequest,
+    RepairPlanOptimizeRequest,
     ReviewReportIssueRequest,
 )
 
@@ -811,4 +812,147 @@ def verify_review_report(report_id: str) -> Dict[str, Any]:
             "observation_fingerprint": obs_hash,
             "ruling_fingerprint": ruling_hash,
         },
+    }
+
+
+# ------------------------------------------------------ repair plan optimize
+
+# 目标观察与候选工包的数量上限（精确求解的输入规模约束）
+MAX_PLAN_ITEMS = 20
+
+
+def _min_cost_cover(pkgs: List[Tuple[str, int, int]], full: int
+                    ) -> Tuple[List[str], int]:
+    """精确最低成本集合覆盖（分支限界；工包数 ≤ 20）。
+
+    ``pkgs`` 元素为 ``(package_id, cost, 覆盖位掩码)``，``full`` 为全部目标
+    的位掩码。返回 ``(排序后的选中编号列表, 总成本)``；总成本相同时依次取
+    工包数更少、排序后编号序列字典序更小者。调用前须保证全覆盖可行。
+
+    剪枝安全性：成本为正整数，任何未覆盖满的节点若当前成本已不劣于最优解，
+    继续选包只会更贵；而最优解的任一真前缀成本都严格小于最优总成本，
+    故成本剪枝与“剩余工包全选仍无法全覆盖”剪枝都不会误杀最优（含并列）
+    解——所有最小成本解都会在终端节点被逐一比较。
+    """
+    # 成本升序（同成本按编号）排列，尽早找到好解以增强剪枝
+    ordered = sorted(pkgs, key=lambda p: (p[1], p[0]))
+    n = len(ordered)
+    suffix_union = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_union[i] = suffix_union[i + 1] | ordered[i][2]
+
+    best_key: Optional[Tuple[int, int, Tuple[str, ...]]] = None
+    best_ids: List[str] = []
+
+    def dfs(i: int, covered: int, cost: int, chosen: List[str]) -> None:
+        nonlocal best_key, best_ids
+        if covered == full:
+            key = (cost, len(chosen), tuple(sorted(chosen)))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_ids = sorted(chosen)
+            return
+        if i == n:
+            return
+        # 剩余工包全选也无法全覆盖 -> 剪枝
+        if covered | suffix_union[i] != full:
+            return
+        # 当前成本已不劣于最优（成本为正，继续只会更高）-> 剪枝
+        if best_key is not None and cost >= best_key[0]:
+            return
+        pid, c, mask = ordered[i]
+        chosen.append(pid)
+        dfs(i + 1, covered | mask, cost + c, chosen)
+        chosen.pop()
+        dfs(i + 1, covered, cost, chosen)
+
+    dfs(0, 0, 0, [])
+    assert best_key is not None  # 调用方已保证全覆盖可行
+    return best_ids, best_key[0]
+
+
+def optimize_repair_plan(req: RepairPlanOptimizeRequest) -> Dict[str, Any]:
+    """只读修补工包优化：对已签发报告的全部来源观察求最低成本覆盖方案。
+
+    - 目标集合 = 报告**签发快照**中各轨迹来源观察去重后的全集
+      （只读快照，不读取现库观察，更不做任何写操作）；
+    - 目标与候选工包各限 20 个；空目标直接返回空方案；
+    - 精确求解：总成本最小；并列时依次取工包数更少、排序后编号序列
+      字典序更小者；
+    - 重复工包编号、工包覆盖未知观察、越限、非法成本 -> 422；
+      报告不存在 -> 404；无法全覆盖 -> 409 并回带未被任何工包覆盖的编号。
+    """
+    # 请求内工包编号唯一性（与报告无关的输入校验，先行拒绝）
+    seen: set[str] = set()
+    for p in req.packages:
+        if p.package_id in seen:
+            raise ApiError(422, f"package_id 重复: {p.package_id}")
+        seen.add(p.package_id)
+
+    with db.get_conn() as conn:
+        row = db.get_review_report(conn, req.report_id)
+    if row is None:
+        raise ApiError(404, f"复核报告不存在: {req.report_id}")
+
+    trajectories = json.loads(row["trajectories_json"])
+    targets = sorted({
+        s["observation_id"]
+        for t in trajectories for s in t["sources"]
+    })
+    if len(targets) > MAX_PLAN_ITEMS:
+        raise ApiError(
+            422,
+            f"报告来源观察数 {len(targets)} 超过上限 {MAX_PLAN_ITEMS}",
+        )
+
+    target_set = set(targets)
+    for p in req.packages:
+        unknown = sorted(set(p.covers) - target_set)
+        if unknown:
+            raise ApiError(
+                422,
+                f"工包 {p.package_id} 覆盖了报告中不存在的观察: {unknown}",
+                extra={"unknown_observation_ids": unknown},
+            )
+
+    # 空目标 -> 空方案（无需任何工包，成本为 0）
+    if not targets:
+        return {
+            "report_id": req.report_id,
+            "targets": [],
+            "target_count": 0,
+            "selected_package_ids": [],
+            "package_count": 0,
+            "total_cost": 0,
+        }
+
+    index = {oid: i for i, oid in enumerate(targets)}
+    pkgs: List[Tuple[str, int, int]] = []
+    union_all = 0
+    for p in req.packages:
+        mask = 0
+        for oid in set(p.covers):
+            mask |= 1 << index[oid]
+        pkgs.append((p.package_id, p.cost, mask))
+        union_all |= mask
+
+    full = (1 << len(targets)) - 1
+    if union_all != full:
+        uncovered = [oid for oid in targets
+                     if not (union_all >> index[oid]) & 1]
+        raise ApiError(
+            409,
+            f"候选工包无法全覆盖目标观察，"
+            f"{len(uncovered)} 个观察未被任何工包覆盖",
+            extra={"uncovered_observation_ids": uncovered},
+        )
+
+    selected, total = _min_cost_cover(pkgs, full)
+    return {
+        "report_id": req.report_id,
+        "targets": targets,
+        "target_count": len(targets),
+        "selected_package_ids": selected,
+        "package_count": len(selected),
+        "total_cost": total,
     }
