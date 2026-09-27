@@ -22,6 +22,8 @@ from .schemas import (
     RecomputeResponse,
     RepairCoverageRequest,
     RepairCoverageResponse,
+    RepairPlanOptimizeRequest,
+    RepairPlanOptimizeResponse,
     ReviewReportIssueRequest,
     ReviewReportSnapshot,
     ReviewReportVerifyResponse,
@@ -37,6 +39,8 @@ app = FastAPI(
         "以及两期巡检间轨迹持续/新增/消失的只读变化报告。"
         "支持签发不可变叶片复核报告：同一事务内校验裁决 revision 并实时成轨，"
         "将轨迹与两类输入指纹固化，随后可只读核验观察/裁决是否已变化。"
+        "支持以已签发报告快照的观察为目标，在候选修补工包中只读求解"
+        "全覆盖且总成本最低的工包子集。"
     ),
     version="1.0.0",
 )
@@ -166,3 +170,13 @@ def get_review_report(report_id: str) -> dict:
 )
 def verify_review_report(report_id: str) -> dict:
     return services.verify_review_report(report_id)
+
+
+@app.post(
+    "/api/v1/repair-plans/optimize",
+    tags=["修补方案优选"],
+    response_model=RepairPlanOptimizeResponse,
+    summary="只读最低成本修补方案：以已签发报告快照目标与候选工包求最优工包子集",
+)
+def optimize_repair_plan(payload: RepairPlanOptimizeRequest) -> dict:
+    return services.optimize_repair_plan(payload)

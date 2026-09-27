@@ -17,6 +17,10 @@
   裁决 `revision`、实时生成轨迹，将轨迹及来源、观察/裁决**两类输入指纹**与签发时间
   固化为**不可变报告**；报告读取永远返回签发快照，核验接口只读重算指纹并指出
   观察或裁决是否已变化；
+- 提供**只读最低成本修补方案优选**：以**已签发报告快照**来源中去重后的全部观察为
+  目标，在候选修补工包（编号 + 正整数成本 + 覆盖观察编号）中精确求解**全覆盖且总
+  成本最小**的工包子集；成本相同时依次取工包数更少、排序后编号序列字典序更小者，
+  全程只读快照，不修改报告或观察；
 - 依赖安装、SQLite 建表与数据库初始化均随容器启动自动完成。
 
 ## 单条命令启动
@@ -103,6 +107,7 @@ docker compose up -d --build
 | POST | `/review-reports` | 签发不可变叶片复核报告（同事务校验 revision、实时成轨并固化） |
 | GET | `/review-reports/{report_id}` | 读取报告签发快照（不可变，不受后续观察/裁决变化影响） |
 | GET | `/review-reports/{report_id}/verify` | 只读核验：重算两类指纹，指出观察/裁决变化及是否仍为当前版本 |
+| POST | `/repair-plans/optimize` | 只读最低成本修补方案：以已签发报告快照目标与候选工包求最优子集 |
 
 ### 1. 写入观察批次
 
@@ -557,6 +562,73 @@ curl -s "http://localhost:8000/api/v1/inspection-changes/WT-A01/B2?before=drone-
 - `is_current`：报告是否仍为当前版本——**两类指纹均未变化**时为 `true`；
 - 核验不执行成轨计算，即使当前裁决相互冲突也能正常返回指纹比对结果。
 
+### 9. 最低成本修补方案优选（只读）
+
+`POST /api/v1/repair-plans/optimize`
+
+以**已签发的复核报告**为输入：从报告签发快照的全部轨迹来源中取**去重后的观察
+编号**作为覆盖目标，在请求携带的候选**修补工包**中精确选择一个**并集覆盖全部
+目标且总成本最小**的工包子集。接口只读取报告快照，不受后续观察/裁决变化影响，
+也不修改报告、观察或任何数据。
+
+请求字段：
+
+| 字段 | 类型/说明 |
+| --- | --- |
+| `report_id` | 已签发的复核报告编号（不存在 → `404`） |
+| `packages` | 候选工包列表，**不超过 20 个**，允许空列表（非空目标时必然 `409`） |
+| `packages[].package_id` | 工包唯一编号（请求内重复 → `422`） |
+| `packages[].cost` | 工包成本，**正整数**（`0`、负数、非整数 → `422`） |
+| `packages[].observation_ids` | 该工包覆盖的观察编号；须全部属于报告目标（出现快照之外的编号 → `422`）；同一编号在一个工包内重复按一次计 |
+
+优化规则：
+
+- 目标为报告快照轨迹来源中**去重**后的全部观察（跨轨迹、重复出现都只计一次），
+  目标数量同样**不超过 20**；
+- 求**加权集合覆盖**的精确最优解（工包覆盖可重叠）：总成本最小；
+- 总成本相同时，依次取 **① 选中工包数更少；② 选中编号按字符串升序排序后的
+  序列字典序更小**者；
+- **空目标**（报告快照没有任何来源观察）直接返回空方案
+  （`selected_package_ids=[]`、`total_cost=0`）；
+- **无法全覆盖**时返回 `409`，并在 `uncovered_observation_ids` 中给出
+  **所有未被任何候选工包覆盖**的目标编号（升序）。
+
+请求示例：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "packages": [
+    {"package_id": "pkg-all", "cost": 10, "observation_ids": ["s1", "s2"]},
+    {"package_id": "pkg-s1", "cost": 4,  "observation_ids": ["s1"]},
+    {"package_id": "pkg-s2", "cost": 5,  "observation_ids": ["s2"]}
+  ]
+}
+```
+
+成功响应（上例 `pkg-s1 + pkg-s2 = 9` 优于 `pkg-all = 10`）：
+
+```json
+{
+  "report_id": "rep-2026-09-27-01",
+  "selected_package_ids": ["pkg-s1", "pkg-s2"],
+  "total_cost": 9,
+  "target_observation_ids": ["s1", "s2"]
+}
+```
+
+无法全覆盖时的 `409` 响应：
+
+```json
+{
+  "detail": "候选工包无法覆盖报告的全部目标观察",
+  "uncovered_observation_ids": ["s3"]
+}
+```
+
+> 目标与工包各限 20，服务端用整数位掩码做精确分支定界求解（含支配工包剔除、
+> 贪心上界与合法下界剪枝），结果与请求内工包顺序无关、可复现。
+
 ## curl 快速验证
 
 ```bash
@@ -607,6 +679,14 @@ curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1
 curl -s http://localhost:8000/api/v1/review-reports/rep-demo-1/verify
 ```
 
+以已签发报告为目标求最低成本修补方案（只读快照）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/repair-plans/optimize \
+  -H 'Content-Type: application/json' \
+  -d '{"report_id":"rep-demo-1","packages":[{"package_id":"pkg-all","cost":10,"observation_ids":["s1","s2"]},{"package_id":"pkg-s1","cost":4,"observation_ids":["s1"]},{"package_id":"pkg-s2","cost":5,"observation_ids":["s2"]}]}'
+```
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -632,9 +712,10 @@ python -m unittest discover -s tests -v
 │   ├── clustering.py   # 并查集聚类 + 轨迹合并
 │   ├── matching.py     # 跨期轨迹配对：重叠面积加权 + 全局最大权一对一匹配
 │   ├── coverage.py     # 只读修补覆盖核对：径向切片精确求修补区域并集覆盖面积
+│   ├── repair_plan.py  # 只读最低成本修补方案：精确分支定界加权集合覆盖（目标/工包各 ≤20）
 │   ├── geometry.py     # 径向/钟位弧相交、重叠长度与合并（含跨 12 点）
 │   └── db.py           # SQLite 连接、schema 初始化、事务与数据访问
-├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 裁决 / 复核报告 / 端到端 API 测试
+├── tests/              # 几何 / 聚类 / 匹配 / 覆盖核对 / 修补方案 / 裁决 / 复核报告 / 端到端 API 测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

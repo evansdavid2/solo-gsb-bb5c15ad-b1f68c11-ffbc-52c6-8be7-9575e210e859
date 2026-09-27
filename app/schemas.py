@@ -275,6 +275,48 @@ class RepairCoverageResponse(BaseModel):
     )
 
 
+class RepairPackageIn(BaseModel):
+    """候选修补工包：编号、正整数成本与覆盖的观察编号清单。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_id: str = Field(..., min_length=1, max_length=64,
+                            description="工包唯一编号（请求内不得重复）")
+    cost: int = Field(..., ge=1, description="工包成本（正整数）")
+    observation_ids: List[str] = Field(
+        ...,
+        description="该工包覆盖的观察编号；须全部属于报告目标，"
+                    "同一编号在一个工包内重复按一次计",
+    )
+
+
+class RepairPlanOptimizeRequest(BaseModel):
+    """只读最低成本修补方案请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_id: str = Field(..., max_length=64, description="已签发的复核报告编号")
+    packages: List[RepairPackageIn] = Field(
+        ...,
+        description="候选修补工包列表；数量不超过 20，允许为空列表"
+                    "（非空目标时必然无法全覆盖）",
+    )
+
+
+class RepairPlanOptimizeResponse(BaseModel):
+    """最低成本修补方案响应（只读：只读取报告快照，不修改报告或观察）。"""
+
+    report_id: str
+    selected_package_ids: List[str] = Field(
+        ..., description="选中的工包编号，按编号升序排列",
+    )
+    total_cost: int = Field(..., description="选中工包的成本合计")
+    target_observation_ids: List[str] = Field(
+        ...,
+        description="报告来源中去重后的全部目标观察编号，按编号升序排列",
+    )
+
+
 class ChangeTrajectorySide(BaseModel):
     """变化报告中一侧（前期或后期）轨迹的摘要。"""
 

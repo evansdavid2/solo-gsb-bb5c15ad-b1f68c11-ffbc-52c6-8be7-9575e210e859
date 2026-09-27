@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import db
 from . import coverage as cov
+from . import repair_plan as rp
 from .clustering import (
     Observation,
     Ruling,
@@ -25,6 +26,7 @@ from .schemas import (
     BatchWriteRequest,
     ObservationIn,
     RepairCoverageRequest,
+    RepairPlanOptimizeRequest,
     ReviewReportIssueRequest,
 )
 
@@ -811,4 +813,102 @@ def verify_review_report(report_id: str) -> Dict[str, Any]:
             "observation_fingerprint": obs_hash,
             "ruling_fingerprint": ruling_hash,
         },
+    }
+
+
+# -------------------------------------------------------- repair plan optimize
+
+def _report_target_ids(snapshot: Dict[str, Any]) -> List[str]:
+    """报告快照轨迹来源中去重后的全部观察编号（按编号升序）。"""
+    targets = {
+        source["observation_id"]
+        for trajectory in snapshot["trajectories"]
+        for source in trajectory["sources"]
+    }
+    return sorted(targets)
+
+
+def optimize_repair_plan(req: RepairPlanOptimizeRequest) -> Dict[str, Any]:
+    """以已签发报告快照为目标，求最低成本修补工包子集（只读）。
+
+    - 目标集合为**报告签发快照**（而非当前库中观察）轨迹来源去重后的
+      全部观察编号——只读取快照，不受后续观察/裁决变化影响，也绝不写库；
+    - 在候选工包中精确求解加权集合覆盖：并集覆盖全部目标且总成本最小；
+      成本相同时依次取工包数更少、排序后编号序列字典序更小者；
+    - 目标与工包各限 20；目标为空（报告快照无任何来源观察）时直接返回
+      空方案；重复工包编号、引用报告之外的观察编号、越限或非法成本返回
+      422；报告不存在返回 404；无法全覆盖返回 409 并回带所有**未被任何
+      工包覆盖**的目标编号。
+    """
+    with db.get_conn() as conn:
+        row = db.get_review_report(conn, req.report_id)
+        if row is None:
+            raise ApiError(404, f"复核报告不存在: {req.report_id}")
+        snapshot = _report_snapshot(row)
+
+    targets = _report_target_ids(snapshot)
+    if len(targets) > rp.MAX_TARGETS:
+        raise ApiError(
+            422,
+            f"报告目标观察数量 {len(targets)} 超过上限 {rp.MAX_TARGETS}",
+        )
+
+    # 空目标：直接返回空方案（不校验候选工包内容）
+    if not targets:
+        return {
+            "report_id": req.report_id,
+            "selected_package_ids": [],
+            "total_cost": 0,
+            "target_observation_ids": [],
+        }
+
+    if len(req.packages) > rp.MAX_PACKAGES:
+        raise ApiError(
+            422,
+            f"候选工包数量 {len(req.packages)} 超过上限 {rp.MAX_PACKAGES}",
+        )
+
+    seen_ids: set[str] = set()
+    for package in req.packages:
+        if package.package_id in seen_ids:
+            raise ApiError(
+                422, f"候选工包编号重复: {package.package_id}")
+        seen_ids.add(package.package_id)
+
+    target_index = {obs_id: i for i, obs_id in enumerate(targets)}
+    candidate: List[Tuple[str, int, int]] = []
+    for package in req.packages:
+        mask = 0
+        for obs_id in set(package.observation_ids):
+            index = target_index.get(obs_id)
+            if index is None:
+                raise ApiError(
+                    422,
+                    f"工包 {package.package_id} 引用了报告目标之外的观察"
+                    f"编号: {obs_id}",
+                )
+            mask |= 1 << index
+        candidate.append((package.package_id, package.cost, mask))
+
+    result = rp.optimize(candidate, len(targets))
+    if result is None:
+        covered = 0
+        for _, _, mask in candidate:
+            covered |= mask
+        uncovered = [
+            obs_id for obs_id, bit_pos in target_index.items()
+            if not (covered & (1 << bit_pos))
+        ]
+        raise ApiError(
+            409,
+            "候选工包无法覆盖报告的全部目标观察",
+            extra={"uncovered_observation_ids": uncovered},
+        )
+
+    total_cost, selected_ids = result
+    return {
+        "report_id": req.report_id,
+        "selected_package_ids": list(selected_ids),
+        "total_cost": total_cost,
+        "target_observation_ids": targets,
     }
